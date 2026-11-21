@@ -5,6 +5,7 @@
 -- 1. Enable Required Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- 2. Create Tables First (Guarantees relations exist before triggers/policies)
 
@@ -91,12 +92,14 @@ ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 
 -- 7. Row Level Security Policies (Idempotent: Drop if exists then create)
 
--- ROOMS POLICIES
+-- ROOMS POLICIES: Viewable only by participants and only while not expired
 DROP POLICY IF EXISTS "Participants can view their room" ON rooms;
 CREATE POLICY "Participants can view their room"
 ON rooms FOR SELECT
 USING (
-    auth.uid() IS NOT NULL AND is_room_participant(id, auth.uid())
+    auth.uid() IS NOT NULL 
+    AND is_room_participant(id, auth.uid())
+    AND (expires_at IS NULL OR expires_at > timezone('utc'::text, now()))
 );
 
 -- PARTICIPANTS POLICIES
@@ -117,14 +120,21 @@ WITH CHECK (
     auth.uid() = user_id
 );
 
--- MESSAGES POLICIES
+-- MESSAGES POLICIES: Readable only by room participants and only while room not expired
 DROP POLICY IF EXISTS "Participants can read messages" ON messages;
 CREATE POLICY "Participants can read messages"
 ON messages FOR SELECT
 USING (
-    auth.uid() IS NOT NULL AND is_room_participant(room_id, auth.uid())
+    auth.uid() IS NOT NULL 
+    AND is_room_participant(room_id, auth.uid())
+    AND EXISTS (
+        SELECT 1 FROM rooms 
+        WHERE id = room_id 
+        AND (expires_at IS NULL OR expires_at > timezone('utc'::text, now()))
+    )
 );
 
+-- Insert messages allowed only in active rooms
 DROP POLICY IF EXISTS "Participants can insert messages in active rooms" ON messages;
 CREATE POLICY "Participants can insert messages in active rooms"
 ON messages FOR INSERT
@@ -361,29 +371,54 @@ BEGIN
 END;
 $$;
 
--- FUNCTION: Permanent Deletion of Expired Rooms (Called by pg_cron or Webhook)
-CREATE OR REPLACE FUNCTION delete_expired_rooms()
+-- FUNCTION: Permanent Deletion of Expired Chat Rooms (Executed via Supabase pg_cron)
+CREATE OR REPLACE FUNCTION cleanup_expired_chat_rooms()
 RETURNS INT
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_deleted_count INT := 0;
 BEGIN
-    -- Delete rooms closed > 1 hour ago, or stale waiting rooms older than 24 hours
-    WITH deleted AS (
-        DELETE FROM rooms
-        WHERE (status = 'closed' AND expires_at <= timezone('utc'::text, now()))
-           OR (status = 'expired')
-           OR (status = 'waiting' AND created_at < timezone('utc'::text, now()) - INTERVAL '24 hours')
+    -- Delete only rooms where status is 'closed' and expires_at <= NOW()
+    -- Active and waiting rooms are strictly preserved and never touched.
+    -- Foreign keys ON DELETE CASCADE automatically remove participants and messages.
+    WITH deleted_rooms AS (
+        DELETE FROM public.rooms
+        WHERE status = 'closed'
+          AND expires_at IS NOT NULL
+          AND expires_at <= timezone('utc'::text, now())
         RETURNING id
     )
-    SELECT COUNT(*) INTO v_deleted_count FROM deleted;
+    SELECT COUNT(*) INTO v_deleted_count FROM deleted_rooms;
 
     RETURN v_deleted_count;
 END;
 $$;
+
+-- Restrict permissions: Do NOT expose deletion to public or authenticated users
+REVOKE ALL ON FUNCTION cleanup_expired_chat_rooms() FROM PUBLIC;
+REVOKE ALL ON FUNCTION cleanup_expired_chat_rooms() FROM anon;
+REVOKE ALL ON FUNCTION cleanup_expired_chat_rooms() FROM authenticated;
+GRANT EXECUTE ON FUNCTION cleanup_expired_chat_rooms() TO postgres, service_role;
+
+-- Backward compatibility alias
+CREATE OR REPLACE FUNCTION delete_expired_rooms()
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    RETURN cleanup_expired_chat_rooms();
+END;
+$$;
+
+REVOKE ALL ON FUNCTION delete_expired_rooms() FROM PUBLIC;
+REVOKE ALL ON FUNCTION delete_expired_rooms() FROM anon;
+REVOKE ALL ON FUNCTION delete_expired_rooms() FROM authenticated;
+GRANT EXECUTE ON FUNCTION delete_expired_rooms() TO postgres, service_role;
 
 -- FUNCTION: Heartbeat / Update Participant Last Seen
 CREATE OR REPLACE FUNCTION heartbeat_presence(p_room_id UUID)
@@ -405,12 +440,10 @@ END;
 $$;
 
 -- 9. Enable Supabase Realtime for instant updates
--- Enable replica identity full for real-time payloads
 ALTER TABLE rooms REPLICA IDENTITY FULL;
 ALTER TABLE participants REPLICA IDENTITY FULL;
 ALTER TABLE messages REPLICA IDENTITY FULL;
 
--- Add tables to supabase_realtime publication
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -435,3 +468,26 @@ BEGIN
     END IF;
 END;
 $$;
+
+-- 10. Schedule Cleanup with Supabase Cron (pg_cron)
+-- Runs every minute ('* * * * *') to physically purge expired rooms
+DO $$
+DECLARE
+    v_job_id BIGINT;
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables 
+        WHERE table_schema = 'cron' AND table_name = 'job'
+    ) THEN
+        SELECT jobid INTO v_job_id FROM cron.job WHERE jobname = 'cleanup-expired-chat-rooms';
+        IF v_job_id IS NOT NULL THEN
+            PERFORM cron.unschedule(v_job_id);
+        END IF;
+    END IF;
+END $$;
+
+SELECT cron.schedule(
+    'cleanup-expired-chat-rooms',
+    '* * * * *',
+    'SELECT public.cleanup_expired_chat_rooms();'
+);

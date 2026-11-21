@@ -23,11 +23,11 @@ export async function GET(request: Request) {
       );
     }
 
-    // Call the database function delete_expired_rooms()
-    const { data, error } = await admin.rpc("delete_expired_rooms");
+    // Call the database function cleanup_expired_chat_rooms()
+    const { data, error } = await admin.rpc("cleanup_expired_chat_rooms");
 
     if (error) {
-      console.error("Cleanup cron failed:", error);
+      console.error("Cleanup execution failed:", error);
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
@@ -38,7 +38,7 @@ export async function GET(request: Request) {
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Cleanup error";
-    console.error("Cleanup cron unhandled error:", message);
+    console.error("Cleanup unhandled error:", message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
