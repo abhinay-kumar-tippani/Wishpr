@@ -214,3 +214,5 @@ To prevent race conditions where three people simultaneously enter a room:
 | **10. Permanent Deletion** | After 1 hour, `delete_expired_rooms` removes the room, participants, and messages permanently. | ✅ |
 | **11. Row-Level Security** | Unauthorized users cannot access messages or rooms by manipulating IDs or querying Supabase directly. | ✅ |
 | **12. Responsive Design** | Works smoothly across desktop, tablet, and mobile browsers with light/dark theme support. | ✅ |
+#   W i s h p r  
+ 
