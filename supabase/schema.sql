@@ -6,17 +6,7 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- 2. Clean Existing Objects (for idempotent execution)
-DROP TRIGGER IF EXISTS trg_max_two_participants ON participants;
-DROP FUNCTION IF EXISTS enforce_max_two_participants();
-DROP FUNCTION IF EXISTS is_room_participant(uuid, uuid);
-DROP FUNCTION IF EXISTS create_room(text);
-DROP FUNCTION IF EXISTS join_room(text, text);
-DROP FUNCTION IF EXISTS end_chat(uuid);
-DROP FUNCTION IF EXISTS delete_expired_rooms();
-DROP FUNCTION IF EXISTS heartbeat_presence(uuid);
-
--- 3. Create Tables
+-- 2. Create Tables First (Guarantees relations exist before triggers/policies)
 
 -- ROOMS TABLE
 CREATE TABLE IF NOT EXISTS rooms (
@@ -50,14 +40,14 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 4. Indexes for High Performance & Cleanup
+-- 3. Indexes for High Performance & Scheduled Cleanup
 CREATE INDEX IF NOT EXISTS idx_rooms_room_code ON rooms(room_code);
 CREATE INDEX IF NOT EXISTS idx_rooms_status_expires ON rooms(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_participants_room_id ON participants(room_id);
 CREATE INDEX IF NOT EXISTS idx_participants_user_id ON participants(user_id);
 CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at ASC);
 
--- 5. Trigger to strictly enforce max 2 participants at database level
+-- 4. Trigger to strictly enforce max 2 participants at database level
 CREATE OR REPLACE FUNCTION enforce_max_two_participants()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -74,12 +64,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Safe to drop trigger now because table 'participants' is guaranteed to exist
+DROP TRIGGER IF EXISTS trg_max_two_participants ON participants;
 CREATE TRIGGER trg_max_two_participants
 BEFORE INSERT ON participants
 FOR EACH ROW
 EXECUTE FUNCTION enforce_max_two_participants();
 
--- 6. Helper Function: Check if user is a registered participant of a room
+-- 5. Helper Function: Check if user is a registered participant of a room
 CREATE OR REPLACE FUNCTION is_room_participant(p_room_id UUID, p_user_id UUID)
 RETURNS BOOLEAN
 LANGUAGE sql
@@ -92,15 +84,15 @@ AS $$
     );
 $$;
 
--- 7. Enable Row Level Security (RLS)
+-- 6. Enable Row Level Security (RLS)
 ALTER TABLE rooms ENABLE ROW LEVEL SECURITY;
 ALTER TABLE participants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 
--- 8. Row Level Security Policies
+-- 7. Row Level Security Policies (Idempotent: Drop if exists then create)
 
 -- ROOMS POLICIES
--- Only participants can view their room details
+DROP POLICY IF EXISTS "Participants can view their room" ON rooms;
 CREATE POLICY "Participants can view their room"
 ON rooms FOR SELECT
 USING (
@@ -108,14 +100,14 @@ USING (
 );
 
 -- PARTICIPANTS POLICIES
--- Only participants of the same room can view room members
+DROP POLICY IF EXISTS "Participants can view room members" ON participants;
 CREATE POLICY "Participants can view room members"
 ON participants FOR SELECT
 USING (
     auth.uid() IS NOT NULL AND is_room_participant(room_id, auth.uid())
 );
 
--- Participants can update their own last_seen_at timestamp
+DROP POLICY IF EXISTS "Participants can update their own last seen" ON participants;
 CREATE POLICY "Participants can update their own last seen"
 ON participants FOR UPDATE
 USING (
@@ -126,14 +118,14 @@ WITH CHECK (
 );
 
 -- MESSAGES POLICIES
--- Only registered room participants can read room messages
+DROP POLICY IF EXISTS "Participants can read messages" ON messages;
 CREATE POLICY "Participants can read messages"
 ON messages FOR SELECT
 USING (
     auth.uid() IS NOT NULL AND is_room_participant(room_id, auth.uid())
 );
 
--- Only registered room participants can send messages, AND room must be 'active'
+DROP POLICY IF EXISTS "Participants can insert messages in active rooms" ON messages;
 CREATE POLICY "Participants can insert messages in active rooms"
 ON messages FOR INSERT
 WITH CHECK (
@@ -146,16 +138,17 @@ WITH CHECK (
     )
 );
 
--- No updates or manual deletes on messages (messages are deleted via room cascade)
+DROP POLICY IF EXISTS "Messages cannot be modified" ON messages;
 CREATE POLICY "Messages cannot be modified"
 ON messages FOR UPDATE
 USING (false);
 
+DROP POLICY IF EXISTS "Messages cannot be deleted individually" ON messages;
 CREATE POLICY "Messages cannot be deleted individually"
 ON messages FOR DELETE
 USING (false);
 
--- 9. Secure PostgreSQL RPC Functions (Atomic & Concurrency-Safe)
+-- 8. Secure PostgreSQL RPC Functions (Atomic & Concurrency-Safe)
 
 -- FUNCTION: Generate unique 8-character room code
 CREATE OR REPLACE FUNCTION generate_room_code()
@@ -411,7 +404,7 @@ BEGIN
 END;
 $$;
 
--- 10. Enable Supabase Realtime for instant updates
+-- 9. Enable Supabase Realtime for instant updates
 -- Enable replica identity full for real-time payloads
 ALTER TABLE rooms REPLICA IDENTITY FULL;
 ALTER TABLE participants REPLICA IDENTITY FULL;
@@ -442,6 +435,3 @@ BEGIN
     END IF;
 END;
 $$;
-
--- Optional pg_cron schedule if pg_cron is available in Supabase:
--- SELECT cron.schedule('cleanup-expired-whispr-rooms', '*/5 * * * *', 'SELECT delete_expired_rooms();');
